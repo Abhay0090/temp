@@ -2,11 +2,23 @@ name: Temporary VPN
 
 on:
   workflow_dispatch:
+    inputs:
+      duration_hours:
+        description: "Keep VPN alive for (hours)"
+        required: false
+        default: "6"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "6"
+          - "12"
 
 jobs:
   vpn:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 720
 
     env:
       NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
@@ -176,14 +188,107 @@ jobs:
           </tls-auth>
           EOF
 
+          # Validate config
+          if ! grep -q "remote ${VPN_HOST} ${VPN_PORT}" ~/client1.ovpn; then
+            echo "Error: Client config does not contain correct remote directive"
+            exit 1
+          fi
+
+          echo "✓ Client config generated successfully"
+
+      - name: Upload .ovpn artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpn-config
+          path: ~/client1.ovpn
+          retention-days: 1
+
+      - name: Display connection details
+        shell: bash
+        run: |
           echo ""
-          echo "============================================="
-          echo "CLIENT CONFIG READY"
-          echo "============================================="
-          echo "Server target: ${VPN_HOST}:${VPN_PORT}"
+          echo "============================================================"
+          echo "✓ VPN SERVER READY!"
+          echo "============================================================"
           echo ""
-          echo "Saved to: ~/client1.ovpn"
-          echo "Use this file in OpenVPN Connect on your device"
-          echo "============================================="
+          echo "📱 CONNECTION DETAILS:"
+          echo "  Server: $VPN_HOST"
+          echo "  Port: $VPN_PORT"
+          echo "  Protocol: TCP"
           echo ""
-          cat ~/client1.ovpn
+          echo "📥 DOWNLOAD CONFIG:"
+          echo "  Look for 'vpn-config' artifact in Actions > Artifacts"
+          echo ""
+          echo "📋 INSTRUCTIONS:"
+          echo "  1. Download client1.ovpn from artifacts"
+          echo "  2. Import into OpenVPN Connect (or compatible client)"
+          echo "  3. Click 'Connect'"
+          echo ""
+          echo "⏱️  UPTIME:"
+          DURATION="${{ inputs.duration_hours }}"
+          if [ -z "$DURATION" ]; then DURATION="6"; fi
+          echo "  VPN will stay alive for approximately ${DURATION} hour(s)"
+          echo ""
+          echo "============================================================"
+          echo ""
+
+      - name: Keep VPN alive
+        shell: bash
+        timeout-minutes: 710
+        run: |
+          set -euxo pipefail
+
+          DURATION_HOURS="${{ inputs.duration_hours }}"
+          if [ -z "$DURATION_HOURS" ]; then DURATION_HOURS="6"; fi
+
+          DURATION_SECONDS=$((DURATION_HOURS * 3600))
+          START_TIME=$(date +%s)
+          END_TIME=$((START_TIME + DURATION_SECONDS))
+
+          echo "VPN server started at $(date)"
+          echo "Will run for $DURATION_HOURS hours until $(date -d @$END_TIME)"
+          echo ""
+
+          HEALTH_CHECK_INTERVAL=60
+          FAILURE_COUNT=0
+          MAX_FAILURES=5
+
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep $HEALTH_CHECK_INTERVAL
+
+            # Health check: OpenVPN
+            if ! pgrep -x openvpn >/dev/null; then
+              FAILURE_COUNT=$((FAILURE_COUNT+1))
+              echo "[ALERT] OpenVPN down! Attempt to restart ($FAILURE_COUNT/$MAX_FAILURES)"
+
+              if [ $FAILURE_COUNT -ge $MAX_FAILURES ]; then
+                echo "[ERROR] OpenVPN failed $MAX_FAILURES times. Stopping."
+                exit 1
+              fi
+
+              sudo openvpn --config /etc/openvpn/server.conf --daemon
+              sleep 5
+            else
+              FAILURE_COUNT=0
+            fi
+
+            # Health check: ngrok tunnel
+            if ! pgrep -x ngrok >/dev/null; then
+              echo "[ALERT] ngrok tunnel down! Restarting..."
+              ngrok tcp "$OPENVPN_SERVER_PORT" > /tmp/ngrok.log 2>&1 &
+              sleep 5
+            fi
+
+            # Log current status
+            ELAPSED=$(($(date +%s) - START_TIME))
+            REMAINING=$((DURATION_SECONDS - ELAPSED))
+            REMAINING_HOURS=$((REMAINING / 3600))
+            REMAINING_MINS=$(( (REMAINING % 3600) / 60 ))
+
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] VPN online. Remaining: ${REMAINING_HOURS}h ${REMAINING_MINS}m"
+          done
+
+          echo ""
+          echo "============================================================"
+          echo "✓ VPN session ended after $DURATION_HOURS hour(s)"
+          echo "============================================================"
