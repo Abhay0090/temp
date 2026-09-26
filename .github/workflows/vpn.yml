@@ -22,86 +22,45 @@ jobs:
 
     env:
       NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
-      PROXY_PORT: "8888"
 
     steps:
-      - name: Install tinyproxy
+      - name: Install dependencies
         shell: bash
         run: |
-          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y tinyproxy curl jq
 
-      - name: Configure tinyproxy
+      - name: Start tinyproxy
         shell: bash
         run: |
-          set -euxo pipefail
-
-          sudo tee /etc/tinyproxy/tinyproxy.conf >/dev/null <<EOF
-          Port 8888
-          Listen 127.0.0.1
-          Timeout 600
-          DefaultErrorFile "/usr/share/tinyproxy/default.html"
-          StatFile "/usr/share/tinyproxy/stats.html"
-          Logfile "/var/log/tinyproxy/tinyproxy.log"
-          LogLevel Info
-          PidFile "/var/run/tinyproxy/tinyproxy.pid"
-          MaxClients 100
-          MinSpareServers 5
-          MaxSpareServers 20
-          StartServers 10
-          MaxRequestsPerChild 0
-          ViaProxyName "tinyproxy"
-          ConnectPort 443
-          ConnectPort 80
-          EOF
-
-          sudo systemctl restart tinyproxy
+          sudo tinyproxy -d -c /etc/tinyproxy/tinyproxy.conf >/tmp/tinyproxy.log 2>&1 &
           sleep 3
-
           if ! pgrep -x tinyproxy >/dev/null; then
             echo "Tinyproxy failed to start"
-            sudo systemctl status tinyproxy
+            cat /tmp/tinyproxy.log
             exit 1
           fi
+          echo "✓ Tinyproxy started"
 
-          echo "✓ Tinyproxy started successfully"
-
-      - name: Install ngrok and start tunnel
+      - name: Start ngrok tunnel
         shell: bash
         run: |
-          set -euxo pipefail
-
-          curl -fsSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
-            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
-            | sudo tee /etc/apt/sources.list.d/ngrok.list
-
-          sudo apt-get update
-          sudo apt-get install -y ngrok
-
           ngrok config add-authtoken "$NGROK_TOKEN"
           ngrok http 8888 > /tmp/ngrok.log 2>&1 &
           sleep 10
 
           ENDPOINT=""
           for i in $(seq 1 30); do
-            ENDPOINT=$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null \
-              | jq -r '.tunnels[] | select(.proto == "http") | .public_url' 2>/dev/null \
-              | head -n 1 || true)
-
+            ENDPOINT=$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null | jq -r '.tunnels[] | select(.proto == "http") | .public_url' 2>/dev/null | head -n 1 || true)
             if [ -n "$ENDPOINT" ] && [ "$ENDPOINT" != "null" ]; then
               break
             fi
-            echo "Waiting for ngrok tunnel... ($i/30)"
             sleep 2
           done
 
           if [ -z "${ENDPOINT:-}" ] || [ "$ENDPOINT" = "null" ]; then
-            echo "ngrok tunnel failed to start"
-            echo "--- ngrok log ---"
-            cat /tmp/ngrok.log || true
+            echo "ngrok failed"
+            cat /tmp/ngrok.log
             exit 1
           fi
 
@@ -116,86 +75,50 @@ jobs:
 
           echo "PROXY_HOST=${PUBLIC_HOST}" >> "$GITHUB_ENV"
           echo "PROXY_PORT=${PUBLIC_PORT}" >> "$GITHUB_ENV"
-          echo "PROXY_URL=${ENDPOINT}" >> "$GITHUB_ENV"
+          echo "PROXY_ENDPOINT=${ENDPOINT}" >> "$GITHUB_ENV"
 
-          echo "✓ ngrok tunnel established"
-          echo "  URL: $ENDPOINT"
-          echo "  HOST: $PUBLIC_HOST"
-          echo "  PORT: $PUBLIC_PORT"
-
-      - name: Display proxy connection details
+      - name: Display proxy details
         shell: bash
         run: |
           echo ""
-          echo "============================================================"
-          echo "✓ HTTP PROXY SERVER READY!"
-          echo "============================================================"
+          echo "=========================================="
+          echo "✓ HTTP PROXY READY"
+          echo "=========================================="
           echo ""
-          echo "📡 PROXY DETAILS:"
-          echo "  Host: $PROXY_HOST"
-          echo "  Port: $PROXY_PORT"
-          echo "  Full URL: $PROXY_URL"
+          echo "Proxy: $PROXY_HOST:$PROXY_PORT"
+          echo "URL: $PROXY_ENDPOINT"
           echo ""
-          echo "🌐 HOW TO USE:"
+          echo "Browser: Set HTTP proxy to $PROXY_HOST port $PROXY_PORT"
+          echo "curl: curl -x http://$PROXY_HOST:$PROXY_PORT https://myip.com"
           echo ""
-          echo "  Browser"
-          echo "  -------"
-          echo "  1. Open browser settings → Network → Proxy"
-          echo "  2. Set HTTP proxy: $PROXY_HOST"
-          echo "  3. Set port: $PROXY_PORT"
-          echo "  4. Visit https://myip.com"
+          echo "=========================================="
           echo ""
-          echo "  curl"
-          echo "  ----"
-          echo "  curl -x http://$PROXY_HOST:$PROXY_PORT https://myip.com"
-          echo ""
-          echo "  Chrome"
-          echo "  ------"
-          echo "  google-chrome --proxy-server=\"http://$PROXY_HOST:$PROXY_PORT\""
-          echo ""
-          echo "============================================================"
 
-      - name: Keep proxy alive
+      - name: Keep alive
         shell: bash
         timeout-minutes: 710
         run: |
-          set -euxo pipefail
-
           DURATION_HOURS="${{ inputs.duration_hours }}"
-          if [ -z "$DURATION_HOURS" ]; then DURATION_HOURS="6"; fi
+          [ -z "$DURATION_HOURS" ] && DURATION_HOURS="6"
 
           DURATION_SECONDS=$((DURATION_HOURS * 3600))
           START_TIME=$(date +%s)
           END_TIME=$((START_TIME + DURATION_SECONDS))
 
-          echo "Proxy server started at $(date)"
-          echo "Will run for $DURATION_HOURS hours until $(date -d @$END_TIME)"
+          echo "Proxy running for $DURATION_HOURS hour(s)..."
           echo ""
 
-          HEALTH_CHECK_INTERVAL=30
-          TINYPROXY_FAILURE_COUNT=0
-          MAX_FAILURES=5
-
           while [ $(date +%s) -lt $END_TIME ]; do
-            sleep $HEALTH_CHECK_INTERVAL
+            sleep 30
 
             if ! pgrep -x tinyproxy >/dev/null; then
-              TINYPROXY_FAILURE_COUNT=$((TINYPROXY_FAILURE_COUNT+1))
-              echo "[ALERT] Tinyproxy down! Attempt to restart ($TINYPROXY_FAILURE_COUNT/$MAX_FAILURES)"
-
-              if [ $TINYPROXY_FAILURE_COUNT -ge $MAX_FAILURES ]; then
-                echo "[ERROR] Tinyproxy failed $MAX_FAILURES times. Stopping."
-                exit 1
-              fi
-
-              sudo systemctl restart tinyproxy
-              sleep 3
-            else
-              TINYPROXY_FAILURE_COUNT=0
+              echo "[$(date +'%H:%M:%S')] Restarting tinyproxy..."
+              sudo tinyproxy -d -c /etc/tinyproxy/tinyproxy.conf >/tmp/tinyproxy.log 2>&1 &
+              sleep 2
             fi
 
             if ! pgrep -x ngrok >/dev/null; then
-              echo "[ALERT] ngrok tunnel down! Restarting..."
+              echo "[$(date +'%H:%M:%S')] Restarting ngrok..."
               ngrok http 8888 > /tmp/ngrok.log 2>&1 &
               sleep 5
             fi
@@ -205,10 +128,8 @@ jobs:
             REMAINING_HOURS=$((REMAINING / 3600))
             REMAINING_MINS=$(( (REMAINING % 3600) / 60 ))
 
-            echo "[$(date +'%Y-%m-%d %H:%M:%S')] Proxy online. Host: $PROXY_HOST | Port: $PROXY_PORT | Remaining: ${REMAINING_HOURS}h ${REMAINING_MINS}m"
+            echo "[$(date +'%H:%M:%S')] Proxy online | Host: $PROXY_HOST:$PROXY_PORT | Remaining: ${REMAINING_HOURS}h ${REMAINING_MINS}m"
           done
 
           echo ""
-          echo "============================================================"
-          echo "✓ Proxy session ended after $DURATION_HOURS hour(s)"
-          echo "============================================================"
+          echo "✓ Proxy session ended"
