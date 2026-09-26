@@ -28,13 +28,23 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           sudo apt-get update
-          sudo apt-get install -y tinyproxy curl jq
+          sudo apt-get install -y tinyproxy curl jq ca-certificates
+
+          curl -fsSL \
+            https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz \
+            -o /tmp/ngrok.tgz
+
+          sudo tar -xzf /tmp/ngrok.tgz -C /usr/local/bin
+          sudo chmod +x /usr/local/bin/ngrok
+          ngrok version
 
       - name: Create tinyproxy config
         shell: bash
         run: |
           set -euxo pipefail
+
           sudo mkdir -p /etc/tinyproxy
           sudo tee /etc/tinyproxy/tinyproxy.conf >/dev/null <<'EOF'
           Port 8888
@@ -59,32 +69,42 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           sudo tinyproxy -d -c /etc/tinyproxy/tinyproxy.conf >/tmp/tinyproxy.log 2>&1 &
           sleep 3
+
           if ! pgrep -x tinyproxy >/dev/null; then
             echo "Tinyproxy failed to start"
             cat /tmp/tinyproxy.log || true
             exit 1
           fi
+
           echo "✓ Tinyproxy started"
 
       - name: Start ngrok tunnel
         shell: bash
         run: |
           set -euxo pipefail
+
+          if [ -z "${NGROK_TOKEN:-}" ]; then
+            echo "NGROK_TOKEN is not configured"
+            exit 1
+          fi
+
           ngrok config add-authtoken "$NGROK_TOKEN"
-          ngrok http 8888 > /tmp/ngrok.log 2>&1 &
+          ngrok tcp 8888 > /tmp/ngrok.log 2>&1 &
           sleep 10
 
           ENDPOINT=""
           for i in $(seq 1 30); do
             ENDPOINT=$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null \
-              | jq -r '.tunnels[] | select(.proto == "http") | .public_url' 2>/dev/null \
+              | jq -r '.tunnels[] | select(.proto == "tcp") | .public_url' 2>/dev/null \
               | head -n 1 || true)
 
             if [ -n "$ENDPOINT" ] && [ "$ENDPOINT" != "null" ]; then
               break
             fi
+
             sleep 2
           done
 
@@ -94,13 +114,12 @@ jobs:
             exit 1
           fi
 
-          PUBLIC_URL="${ENDPOINT#http://}"
-          PUBLIC_URL="${PUBLIC_URL#https://}"
+          PUBLIC_URL="${ENDPOINT#tcp://}"
           PUBLIC_HOST="${PUBLIC_URL%:*}"
           PUBLIC_PORT="${PUBLIC_URL##*:}"
 
           if [ "$PUBLIC_PORT" = "$PUBLIC_HOST" ]; then
-            PUBLIC_PORT="80"
+            PUBLIC_PORT="8888"
           fi
 
           echo "PROXY_HOST=${PUBLIC_HOST}" >> "$GITHUB_ENV"
@@ -151,14 +170,14 @@ jobs:
 
             if ! pgrep -x ngrok >/dev/null; then
               echo "[$(date +'%H:%M:%S')] Restarting ngrok..."
-              ngrok http 8888 > /tmp/ngrok.log 2>&1 &
+              ngrok tcp 8888 > /tmp/ngrok.log 2>&1 &
               sleep 5
             fi
 
             ELAPSED=$(($(date +%s) - START_TIME))
             REMAINING=$((DURATION_SECONDS - ELAPSED))
             REMAINING_HOURS=$((REMAINING / 3600))
-            REMAINING_MINS=$(( (REMAINING % 3600) / 60 ))
+            REMAINING_MINS=$(((REMAINING % 3600) / 60))
 
             echo "[$(date +'%H:%M:%S')] Proxy online | Host: $PROXY_HOST:$PROXY_PORT | Remaining: ${REMAINING_HOURS}h ${REMAINING_MINS}m"
           done
