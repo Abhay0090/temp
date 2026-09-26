@@ -79,9 +79,9 @@ jobs:
             exit 1
           fi
 
-          echo "✓ Tinyproxy started"
+          echo "✓ Tinyproxy started on port 8888"
 
-      - name: Start ngrok tunnel
+      - name: Start ngrok tunnel (TCP mode)
         shell: bash
         run: |
           set -euxo pipefail
@@ -92,13 +92,15 @@ jobs:
           fi
 
           ngrok config add-authtoken "$NGROK_TOKEN"
-          ngrok http --scheme=http 8888 > /tmp/ngrok.log 2>&1 &
+          
+          # Use TCP tunnel to properly forward CONNECT requests
+          ngrok tcp 8888 > /tmp/ngrok.log 2>&1 &
           sleep 10
 
           ENDPOINT=""
           for i in $(seq 1 30); do
             ENDPOINT=$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null \
-              | jq -r '.tunnels[] | select(.proto == "http") | .public_url' 2>/dev/null \
+              | jq -r '.tunnels[] | select(.proto == "tcp") | .public_url' 2>/dev/null \
               | head -n 1 || true)
 
             if [ -n "$ENDPOINT" ] && [ "$ENDPOINT" != "null" ]; then
@@ -109,43 +111,39 @@ jobs:
           done
 
           if [ -z "${ENDPOINT:-}" ] || [ "$ENDPOINT" = "null" ]; then
-            echo "ngrok failed"
+            echo "ngrok failed to create tunnel"
             cat /tmp/ngrok.log || true
             exit 1
           fi
 
-          PUBLIC_URL="${ENDPOINT#http://}"
-          PUBLIC_URL="${PUBLIC_URL#https://}"
+          # Parse ngrok endpoint: tcp://4.tcp.ngrok.io:12345
+          PUBLIC_URL="${ENDPOINT#tcp://}"
           PUBLIC_HOST="${PUBLIC_URL%:*}"
           PUBLIC_PORT="${PUBLIC_URL##*:}"
 
-          if [ "$PUBLIC_PORT" = "$PUBLIC_HOST" ]; then
-            PUBLIC_PORT="80"
-          fi
-
           echo "PROXY_HOST=${PUBLIC_HOST}" >> "$GITHUB_ENV"
           echo "PROXY_PORT=${PUBLIC_PORT}" >> "$GITHUB_ENV"
-          echo "PROXY_ENDPOINT=http://${PUBLIC_HOST}:${PUBLIC_PORT}" >> "$GITHUB_ENV"
+          echo "PROXY_ENDPOINT=${ENDPOINT}" >> "$GITHUB_ENV"
 
       - name: Display proxy details
         shell: bash
         run: |
           echo ""
           echo "=========================================="
-          echo "✓ HTTP PROXY READY"
+          echo "✓ HTTP PROXY READY (TCP Tunnel)"
           echo "=========================================="
           echo ""
-          echo "Proxy Host: $PROXY_HOST"
-          echo "Proxy Port: $PROXY_PORT"
-          echo "Full Endpoint: $PROXY_ENDPOINT"
+          echo "Endpoint: $PROXY_ENDPOINT"
+          echo "Host: $PROXY_HOST"
+          echo "Port: $PROXY_PORT"
           echo ""
-          echo "iPhone/iOS: Settings → Wi-Fi → Configure Proxy"
+          echo "iPhone/iPad Configuration:"
+          echo "  Settings → Wi-Fi → (Network) → ⓘ → HTTP Proxy"
+          echo "  Manual"
           echo "  Server: $PROXY_HOST"
           echo "  Port: $PROXY_PORT"
           echo ""
-          echo "Windows/Mac: $PROXY_HOST:$PROXY_PORT"
-          echo ""
-          echo "Test command:"
+          echo "Windows/Mac Test:"
           echo "  curl -x http://$PROXY_HOST:$PROXY_PORT https://api.ipify.org"
           echo ""
           echo "=========================================="
@@ -178,7 +176,7 @@ jobs:
 
             if ! pgrep -x ngrok >/dev/null; then
               echo "[$(date +'%H:%M:%S')] Restarting ngrok..."
-              ngrok http --scheme=http 8888 > /tmp/ngrok.log 2>&1 &
+              ngrok tcp 8888 > /tmp/ngrok.log 2>&1 &
               sleep 5
             fi
 
