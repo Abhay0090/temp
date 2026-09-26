@@ -27,17 +27,43 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y tinyproxy curl jq
+
+      - name: Create tinyproxy config
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /etc/tinyproxy
+          sudo tee /etc/tinyproxy/tinyproxy.conf >/dev/null <<'EOF'
+          Port 8888
+          Listen 127.0.0.1
+          Timeout 600
+          DefaultErrorFile "/usr/share/tinyproxy/default.html"
+          StatFile "/usr/share/tinyproxy/stats.html"
+          Logfile "/var/log/tinyproxy/tinyproxy.log"
+          LogLevel Info
+          PidFile "/var/run/tinyproxy/tinyproxy.pid"
+          MaxClients 100
+          MinSpareServers 5
+          MaxSpareServers 20
+          StartServers 10
+          MaxRequestsPerChild 0
+          ViaProxyName "tinyproxy"
+          ConnectPort 443
+          ConnectPort 80
+          EOF
 
       - name: Start tinyproxy
         shell: bash
         run: |
+          set -euxo pipefail
           sudo tinyproxy -d -c /etc/tinyproxy/tinyproxy.conf >/tmp/tinyproxy.log 2>&1 &
           sleep 3
           if ! pgrep -x tinyproxy >/dev/null; then
             echo "Tinyproxy failed to start"
-            cat /tmp/tinyproxy.log
+            cat /tmp/tinyproxy.log || true
             exit 1
           fi
           echo "✓ Tinyproxy started"
@@ -45,13 +71,17 @@ jobs:
       - name: Start ngrok tunnel
         shell: bash
         run: |
+          set -euxo pipefail
           ngrok config add-authtoken "$NGROK_TOKEN"
           ngrok http 8888 > /tmp/ngrok.log 2>&1 &
           sleep 10
 
           ENDPOINT=""
           for i in $(seq 1 30); do
-            ENDPOINT=$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null | jq -r '.tunnels[] | select(.proto == "http") | .public_url' 2>/dev/null | head -n 1 || true)
+            ENDPOINT=$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null \
+              | jq -r '.tunnels[] | select(.proto == "http") | .public_url' 2>/dev/null \
+              | head -n 1 || true)
+
             if [ -n "$ENDPOINT" ] && [ "$ENDPOINT" != "null" ]; then
               break
             fi
@@ -60,7 +90,7 @@ jobs:
 
           if [ -z "${ENDPOINT:-}" ] || [ "$ENDPOINT" = "null" ]; then
             echo "ngrok failed"
-            cat /tmp/ngrok.log
+            cat /tmp/ngrok.log || true
             exit 1
           fi
 
@@ -98,6 +128,8 @@ jobs:
         shell: bash
         timeout-minutes: 710
         run: |
+          set -euxo pipefail
+
           DURATION_HOURS="${{ inputs.duration_hours }}"
           [ -z "$DURATION_HOURS" ] && DURATION_HOURS="6"
 
