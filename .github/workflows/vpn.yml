@@ -1,10 +1,10 @@
-name: Temporary VPN
+name: HTTP Proxy Server
 
 on:
   workflow_dispatch:
     inputs:
       duration_hours:
-        description: "Keep VPN alive for (hours)"
+        description: "Keep proxy alive for (hours)"
         required: false
         default: "6"
         type: choice
@@ -16,24 +16,61 @@ on:
           - "12"
 
 jobs:
-  vpn:
+  proxy:
     runs-on: ubuntu-latest
     timeout-minutes: 720
 
     env:
       NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
-      OPENVPN_SERVER_PORT: "1194"
-      CLIENT_NAME: "client1"
+      PROXY_PORT: "8888"
 
     steps:
-      - name: Install software
+      - name: Install tinyproxy
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y tinyproxy curl jq
+
+      - name: Configure tinyproxy
         shell: bash
         run: |
           set -euxo pipefail
 
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            openvpn easy-rsa curl jq qrencode
+          sudo tee /etc/tinyproxy/tinyproxy.conf >/dev/null <<EOF
+          Port 8888
+          Listen 127.0.0.1
+          Timeout 600
+          DefaultErrorFile "/usr/share/tinyproxy/default.html"
+          StatFile "/usr/share/tinyproxy/stats.html"
+          Logfile "/var/log/tinyproxy/tinyproxy.log"
+          LogLevel Info
+          PidFile "/var/run/tinyproxy/tinyproxy.pid"
+          MaxClients 100
+          MinSpareServers 5
+          MaxSpareServers 20
+          StartServers 10
+          MaxRequestsPerChild 0
+          ViaProxyName "tinyproxy"
+          ConnectPort 443
+          ConnectPort 80
+          EOF
+
+          sudo systemctl restart tinyproxy
+          sleep 3
+
+          if ! pgrep -x tinyproxy >/dev/null; then
+            echo "Tinyproxy failed to start"
+            sudo systemctl status tinyproxy
+            exit 1
+          fi
+
+          echo "✓ Tinyproxy started successfully"
+
+      - name: Install ngrok and start tunnel
+        shell: bash
+        run: |
+          set -euxo pipefail
 
           curl -fsSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
             | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
@@ -44,195 +81,81 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ngrok
 
-      - name: Setup OpenVPN PKI
-        shell: bash
-        env:
-          EASYRSA_BATCH: "1"
-        run: |
-          set -euxo pipefail
-
           ngrok config add-authtoken "$NGROK_TOKEN"
-
-          mkdir -p ~/vpn
-          cd ~/vpn
-          cp -r /usr/share/easy-rsa/* .
-
-          ./easyrsa init-pki
-
-          EASYRSA_REQ_CN="VPN-CA" ./easyrsa build-ca nopass
-          ./easyrsa build-server-full server nopass
-          ./easyrsa build-client-full "$CLIENT_NAME" nopass
-          ./easyrsa gen-dh
-
-          sudo cp pki/ca.crt pki/issued/server.crt pki/private/server.key pki/dh.pem /etc/openvpn/
-          sudo openvpn --genkey --secret /etc/openvpn/ta.key
-
-          cp pki/ca.crt pki/issued/"$CLIENT_NAME".crt pki/private/"$CLIENT_NAME".key ~/
-
-      - name: Configure and start OpenVPN server + ngrok tunnel
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          sudo tee /etc/openvpn/server.conf >/dev/null <<EOF
-          port 1194
-          proto tcp-server
-          dev tun
-          ca /etc/openvpn/ca.crt
-          cert /etc/openvpn/server.crt
-          key /etc/openvpn/server.key
-          dh /etc/openvpn/dh.pem
-          server 10.8.0.0 255.255.255.0
-          push "redirect-gateway def1 bypass-dhcp"
-          push "dhcp-option DNS 8.8.8.8"
-          push "dhcp-option DNS 8.8.4.4"
-          keepalive 10 120
-          tls-auth /etc/openvpn/ta.key 0
-          cipher AES-256-GCM
-          auth SHA256
-          user nobody
-          group nogroup
-          persist-key
-          persist-tun
-          status /var/log/openvpn/status.log
-          verb 3
-          EOF
-
-          echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-openvpn.conf >/dev/null
-          sudo sysctl --system >/dev/null
-
-          # Enable masquerading for all interfaces
-          sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE
-
-          sudo openvpn --config /etc/openvpn/server.conf --daemon
-          sleep 5
-
-          if ! pgrep -x openvpn >/dev/null; then
-            echo "OpenVPN failed to start"
-            exit 1
-          fi
-
-          ngrok tcp "$OPENVPN_SERVER_PORT" > /tmp/ngrok.log 2>&1 &
-          sleep 8
+          ngrok http 8888 > /tmp/ngrok.log 2>&1 &
+          sleep 10
 
           ENDPOINT=""
           for i in $(seq 1 30); do
             ENDPOINT=$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null \
-              | jq -r '.tunnels[] | select(.proto == "tcp") | .public_url' 2>/dev/null \
+              | jq -r '.tunnels[] | select(.proto == "http") | .public_url' 2>/dev/null \
               | head -n 1 || true)
 
             if [ -n "$ENDPOINT" ] && [ "$ENDPOINT" != "null" ]; then
               break
             fi
+            echo "Waiting for ngrok tunnel... ($i/30)"
             sleep 2
           done
 
           if [ -z "${ENDPOINT:-}" ] || [ "$ENDPOINT" = "null" ]; then
-            echo "ngrok tunnel did not start or API is not ready"
+            echo "ngrok tunnel failed to start"
             echo "--- ngrok log ---"
             cat /tmp/ngrok.log || true
             exit 1
           fi
 
-          PUBLIC_HOST="${ENDPOINT#tcp://}"
-          PUBLIC_HOST="${PUBLIC_HOST%:*}"
-          PUBLIC_PORT="${ENDPOINT##*:}"
+          PUBLIC_URL="${ENDPOINT#http://}"
+          PUBLIC_URL="${PUBLIC_URL#https://}"
+          PUBLIC_HOST="${PUBLIC_URL%:*}"
+          PUBLIC_PORT="${PUBLIC_URL##*:}"
 
-          echo "VPN_HOST=${PUBLIC_HOST}" >> "$GITHUB_ENV"
-          echo "VPN_PORT=${PUBLIC_PORT}" >> "$GITHUB_ENV"
+          if [ "$PUBLIC_PORT" = "$PUBLIC_HOST" ]; then
+            PUBLIC_PORT="80"
+          fi
 
-          echo "Tunnel ready:"
+          echo "PROXY_HOST=${PUBLIC_HOST}" >> "$GITHUB_ENV"
+          echo "PROXY_PORT=${PUBLIC_PORT}" >> "$GITHUB_ENV"
+          echo "PROXY_URL=${ENDPOINT}" >> "$GITHUB_ENV"
+
+          echo "✓ ngrok tunnel established"
+          echo "  URL: $ENDPOINT"
           echo "  HOST: $PUBLIC_HOST"
           echo "  PORT: $PUBLIC_PORT"
 
-      - name: Generate client .ovpn config
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          if [ -z "${VPN_HOST:-}" ] || [ -z "${VPN_PORT:-}" ]; then
-            echo "VPN_HOST or VPN_PORT missing"
-            exit 1
-          fi
-
-          cd ~/vpn
-
-          cat > ~/client1.ovpn <<EOF
-          client
-          dev tun
-          proto tcp
-          remote ${VPN_HOST} ${VPN_PORT}
-          resolv-retry infinite
-          nobind
-          persist-key
-          persist-tun
-          remote-cert-tls server
-          cipher AES-256-GCM
-          auth SHA256
-          verb 3
-          key-direction 1
-
-          <ca>
-          $(cat pki/ca.crt)
-          </ca>
-
-          <cert>
-          $(cat pki/issued/client1.crt)
-          </cert>
-
-          <key>
-          $(cat pki/private/client1.key)
-          </key>
-
-          <tls-auth>
-          $(sudo cat /etc/openvpn/ta.key)
-          </tls-auth>
-          EOF
-
-          if ! grep -q "remote ${VPN_HOST} ${VPN_PORT}" ~/client1.ovpn; then
-            echo "Error: Client config does not contain correct remote directive"
-            exit 1
-          fi
-
-          echo "✓ Client config generated successfully"
-
-      - name: Upload .ovpn artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: vpn-config
-          path: ~/client1.ovpn
-          retention-days: 1
-
-      - name: Display connection details
+      - name: Display proxy connection details
         shell: bash
         run: |
           echo ""
           echo "============================================================"
-          echo "✓ VPN SERVER READY!"
+          echo "✓ HTTP PROXY SERVER READY!"
           echo "============================================================"
           echo ""
-          echo "📱 CONNECTION DETAILS:"
-          echo "  Server: $VPN_HOST"
-          echo "  Port: $VPN_PORT"
-          echo "  Protocol: TCP"
+          echo "📡 PROXY DETAILS:"
+          echo "  Host: $PROXY_HOST"
+          echo "  Port: $PROXY_PORT"
+          echo "  Full URL: $PROXY_URL"
           echo ""
-          echo "📥 DOWNLOAD CONFIG:"
-          echo "  Look for 'vpn-config' artifact in Actions > Artifacts"
+          echo "🌐 HOW TO USE:"
           echo ""
-          echo "📋 INSTRUCTIONS:"
-          echo "  1. Download client1.ovpn from artifacts"
-          echo "  2. Import into OpenVPN Connect (or compatible client)"
-          echo "  3. Click 'Connect'"
+          echo "  Browser"
+          echo "  -------"
+          echo "  1. Open browser settings → Network → Proxy"
+          echo "  2. Set HTTP proxy: $PROXY_HOST"
+          echo "  3. Set port: $PROXY_PORT"
+          echo "  4. Visit https://myip.com"
           echo ""
-          echo "⏱️  UPTIME:"
-          DURATION="${{ inputs.duration_hours }}"
-          if [ -z "$DURATION" ]; then DURATION="6"; fi
-          echo "  VPN will stay alive for approximately ${DURATION} hour(s)"
+          echo "  curl"
+          echo "  ----"
+          echo "  curl -x http://$PROXY_HOST:$PROXY_PORT https://myip.com"
+          echo ""
+          echo "  Chrome"
+          echo "  ------"
+          echo "  google-chrome --proxy-server=\"http://$PROXY_HOST:$PROXY_PORT\""
           echo ""
           echo "============================================================"
-          echo ""
 
-      - name: Keep VPN alive
+      - name: Keep proxy alive
         shell: bash
         timeout-minutes: 710
         run: |
@@ -245,35 +168,35 @@ jobs:
           START_TIME=$(date +%s)
           END_TIME=$((START_TIME + DURATION_SECONDS))
 
-          echo "VPN server started at $(date)"
+          echo "Proxy server started at $(date)"
           echo "Will run for $DURATION_HOURS hours until $(date -d @$END_TIME)"
           echo ""
 
-          HEALTH_CHECK_INTERVAL=60
-          FAILURE_COUNT=0
+          HEALTH_CHECK_INTERVAL=30
+          TINYPROXY_FAILURE_COUNT=0
           MAX_FAILURES=5
 
           while [ $(date +%s) -lt $END_TIME ]; do
             sleep $HEALTH_CHECK_INTERVAL
 
-            if ! pgrep -x openvpn >/dev/null; then
-              FAILURE_COUNT=$((FAILURE_COUNT+1))
-              echo "[ALERT] OpenVPN down! Attempt to restart ($FAILURE_COUNT/$MAX_FAILURES)"
+            if ! pgrep -x tinyproxy >/dev/null; then
+              TINYPROXY_FAILURE_COUNT=$((TINYPROXY_FAILURE_COUNT+1))
+              echo "[ALERT] Tinyproxy down! Attempt to restart ($TINYPROXY_FAILURE_COUNT/$MAX_FAILURES)"
 
-              if [ $FAILURE_COUNT -ge $MAX_FAILURES ]; then
-                echo "[ERROR] OpenVPN failed $MAX_FAILURES times. Stopping."
+              if [ $TINYPROXY_FAILURE_COUNT -ge $MAX_FAILURES ]; then
+                echo "[ERROR] Tinyproxy failed $MAX_FAILURES times. Stopping."
                 exit 1
               fi
 
-              sudo openvpn --config /etc/openvpn/server.conf --daemon
-              sleep 5
+              sudo systemctl restart tinyproxy
+              sleep 3
             else
-              FAILURE_COUNT=0
+              TINYPROXY_FAILURE_COUNT=0
             fi
 
             if ! pgrep -x ngrok >/dev/null; then
               echo "[ALERT] ngrok tunnel down! Restarting..."
-              ngrok tcp "$OPENVPN_SERVER_PORT" > /tmp/ngrok.log 2>&1 &
+              ngrok http 8888 > /tmp/ngrok.log 2>&1 &
               sleep 5
             fi
 
@@ -282,10 +205,10 @@ jobs:
             REMAINING_HOURS=$((REMAINING / 3600))
             REMAINING_MINS=$(( (REMAINING % 3600) / 60 ))
 
-            echo "[$(date +'%Y-%m-%d %H:%M:%S')] VPN online. Remaining: ${REMAINING_HOURS}h ${REMAINING_MINS}m"
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] Proxy online. Host: $PROXY_HOST | Port: $PROXY_PORT | Remaining: ${REMAINING_HOURS}h ${REMAINING_MINS}m"
           done
 
           echo ""
           echo "============================================================"
-          echo "✓ VPN session ended after $DURATION_HOURS hour(s)"
+          echo "✓ Proxy session ended after $DURATION_HOURS hour(s)"
           echo "============================================================"
