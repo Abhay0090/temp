@@ -83,7 +83,6 @@ jobs:
           key /etc/openvpn/server.key
           dh /etc/openvpn/dh.pem
           server 10.8.0.0 255.255.255.0
-          push "redirect-gateway def1 bypass-dhcp"
           push "dhcp-option DNS 1.1.1.1"
           keepalive 10 120
           tls-auth /etc/openvpn/ta.key 0
@@ -188,7 +187,6 @@ jobs:
           </tls-auth>
           EOF
 
-          # Validate config
           if ! grep -q "remote ${VPN_HOST} ${VPN_PORT}" ~/client1.ovpn; then
             echo "Error: Client config does not contain correct remote directive"
             exit 1
@@ -256,7 +254,6 @@ jobs:
           while [ $(date +%s) -lt $END_TIME ]; do
             sleep $HEALTH_CHECK_INTERVAL
 
-            # Health check: OpenVPN
             if ! pgrep -x openvpn >/dev/null; then
               FAILURE_COUNT=$((FAILURE_COUNT+1))
               echo "[ALERT] OpenVPN down! Attempt to restart ($FAILURE_COUNT/$MAX_FAILURES)"
@@ -272,14 +269,12 @@ jobs:
               FAILURE_COUNT=0
             fi
 
-            # Health check: ngrok tunnel
             if ! pgrep -x ngrok >/dev/null; then
               echo "[ALERT] ngrok tunnel down! Restarting..."
               ngrok tcp "$OPENVPN_SERVER_PORT" > /tmp/ngrok.log 2>&1 &
               sleep 5
             fi
 
-            # Log current status
             ELAPSED=$(($(date +%s) - START_TIME))
             REMAINING=$((DURATION_SECONDS - ELAPSED))
             REMAINING_HOURS=$((REMAINING / 3600))
