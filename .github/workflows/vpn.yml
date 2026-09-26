@@ -23,33 +23,34 @@ jobs:
           sudo apt-get update && sudo apt-get install -y ngrok
 
       - name: Setup VPN
+        env:
+          EASYRSA_BATCH: "1"
+          EASYRSA_REQ_CN: "VPN-CA"
         run: |
           ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
           
-          # Create certificates with batch mode (non-interactive)
+          # Create certificates
           mkdir -p ~/vpn && cd ~/vpn
           cp -r /usr/share/easy-rsa/* .
           
-          # Initialize PKI
+          # Initialize PKI (non-interactive via env vars)
           ./easyrsa init-pki
           
-          # Build CA with batch flag and explicit CN
-          ./easyrsa build-ca --batch --req-cn="VPN-CA-$(date +%s)" nopass
+          # Build CA - uses EASYRSA_REQ_CN from env, no prompts
+          ./easyrsa build-ca nopass
           
           # Build server cert
-          ./easyrsa build-server-full --batch server nopass
+          ./easyrsa build-server-full server nopass
           
           # Build client cert
-          ./easyrsa build-client-full --batch client1 nopass
+          ./easyrsa build-client-full client1 nopass
           
           # Generate DH params
           ./easyrsa gen-dh
           
-          # Install certs to OpenVPN
+          # Install certs
           sudo cp pki/ca.crt pki/issued/server.crt pki/private/server.key pki/dh.pem /etc/openvpn/
           sudo openvpn --genkey --secret /etc/openvpn/ta.key
-          
-          # Copy client files for config generation
           cp pki/ca.crt pki/issued/client1.crt pki/private/client1.key ~/
 
       - name: Configure and Start
@@ -78,7 +79,7 @@ jobs:
           verb 3
           EOF
           
-          # Enable IP forwarding and NAT
+          # Enable IP forwarding
           echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.conf
           sudo sysctl -p
           IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
@@ -88,13 +89,12 @@ jobs:
           sudo openvpn --config /etc/openvpn/server.conf --daemon
           sleep 3
           
-          # Verify OpenVPN started
           if ! pgrep -f "openvpn" > /dev/null; then
             echo "Error: OpenVPN failed to start"
             exit 1
           fi
           
-          # Start ngrok tunnel
+          # Start ngrok
           ngrok tcp 1194 &
           sleep 10
           
@@ -126,7 +126,6 @@ jobs:
           echo "VPN IS READY!"
           echo "Address: $HOST"
           echo "Port: $PORT"
-          echo "Full Endpoint: $HOST:$PORT"
           echo "=========================================="
           
           # Create client config
@@ -169,14 +168,6 @@ jobs:
           echo ""
           echo "QR CODE (scan with phone):"
           qrencode -t ANSIUTF8 < ~/client1.ovpn
-          echo ""
-          echo "VPN will remain active for 6 hours"
           
-          # Keep workflow running
-          while true; do 
-            sleep 60
-            # Keep-alive check
-            if ! pgrep -f "openvpn" > /dev/null; then
-              echo "Warning: OpenVPN stopped"
-            fi
-          done
+          # Keep running
+          while true; do sleep 60; done
