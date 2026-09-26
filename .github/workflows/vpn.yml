@@ -1,0 +1,137 @@
+name: Temporary VPN
+
+on:
+  workflow_dispatch:
+
+env:
+  NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+
+jobs:
+  vpn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: Install Software
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openvpn easy-rsa curl jq qrencode
+          
+          # Install ngrok
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update && sudo apt-get install -y ngrok
+
+      - name: Setup VPN
+        run: |
+          ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
+          
+          # Create certificates
+          mkdir -p ~/vpn && cd ~/vpn
+          cp -r /usr/share/easy-rsa/* .
+          ./easyrsa init-pki
+          echo -e "\n\n\n\n\n\n\n" | ./easyrsa build-ca nopass
+          ./easyrsa build-server-full server nopass
+          ./easyrsa build-client-full client1 nopass
+          ./easyrsa gen-dh
+          
+          # Install certs
+          sudo cp pki/ca.crt pki/issued/server.crt pki/private/server.key pki/dh.pem /etc/openvpn/
+          sudo openvpn --genkey --secret /etc/openvpn/ta.key
+          cp pki/ca.crt pki/issued/client1.crt pki/private/client1.key ~/
+
+      - name: Configure and Start
+        run: |
+          # Create server config
+          sudo tee /etc/openvpn/server.conf << EOF
+          port 1194
+          proto tcp-server
+          dev tun
+          ca /etc/openvpn/ca.crt
+          cert /etc/openvpn/server.crt
+          key /etc/openvpn/server.key
+          dh /etc/openvpn/dh.pem
+          server 10.8.0.0 255.255.255.0
+          push "redirect-gateway def1 bypass-dhcp"
+          push "dhcp-option DNS 1.1.1.1"
+          keepalive 10 120
+          tls-auth /etc/openvpn/ta.key 0
+          cipher AES-256-GCM
+          auth SHA256
+          user nobody
+          group nogroup
+          persist-key
+          persist-tun
+          status /var/log/openvpn/status.log
+          verb 3
+          EOF
+          
+          # Enable internet sharing
+          echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.conf
+          sudo sysctl -p
+          IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+          sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $IFACE -j MASQUERADE
+          
+          # Start VPN
+          sudo openvpn --config /etc/openvpn/server.conf --daemon
+          sleep 3
+          
+          # Start tunnel
+          ngrok tcp 1194 &
+          sleep 8
+          
+          # Get connection info
+          ENDPOINT=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url' | sed 's/tcp:\/\///')
+          HOST=$(echo $ENDPOINT | cut -d':' -f1)
+          PORT=$(echo $ENDPOINT | cut -d':' -f2)
+          
+          echo ""
+          echo "=========================================="
+          echo "VPN IS READY!"
+          echo "Address: $HOST"
+          echo "Port: $PORT"
+          echo "=========================================="
+          
+          # Create client config
+          cat > ~/client1.ovpn << EOF
+          client
+          dev tun
+          proto tcp
+          remote $HOST $PORT
+          resolv-retry infinite
+          nobind
+          persist-key
+          persist-tun
+          remote-cert-tls server
+          cipher AES-256-GCM
+          auth SHA256
+          verb 3
+          key-direction 1
+          
+          <ca>
+          $(cat ~/vpn/pki/ca.crt)
+          </ca>
+          
+          <cert>
+          $(cat ~/vpn/pki/issued/client1.crt)
+          </cert>
+          
+          <key>
+          $(cat ~/vpn/pki/private/client1.key)
+          </key>
+          
+          <tls-auth>
+          $(sudo cat /etc/openvpn/ta.key)
+          </tls-auth>
+          EOF
+          
+          echo ""
+          echo "=== COPY THIS FILE CONTENT BELOW ==="
+          cat ~/client1.ovpn
+          echo "=== END OF FILE ==="
+          echo ""
+          echo "QR CODE (scan with phone):"
+          qrencode -t ANSIUTF8 < ~/client1.ovpn
+          
+          # Keep running
+          while true; do sleep 60; done
