@@ -25,7 +25,6 @@ jobs:
       - name: Setup VPN
         env:
           EASYRSA_BATCH: "1"
-          EASYRSA_REQ_CN: "VPN-CA"
         run: |
           ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
           
@@ -33,16 +32,16 @@ jobs:
           mkdir -p ~/vpn && cd ~/vpn
           cp -r /usr/share/easy-rsa/* .
           
-          # Initialize PKI (non-interactive via env vars)
+          # Initialize PKI
           ./easyrsa init-pki
           
-          # Build CA - uses EASYRSA_REQ_CN from env, no prompts
-          ./easyrsa build-ca nopass
+          # Build CA with explicit CN (only for this command)
+          EASYRSA_REQ_CN="VPN-CA" ./easyrsa build-ca nopass
           
-          # Build server cert
+          # Build server cert (uses "server" as CN automatically)
           ./easyrsa build-server-full server nopass
           
-          # Build client cert
+          # Build client cert (uses "client1" as CN automatically)
           ./easyrsa build-client-full client1 nopass
           
           # Generate DH params
