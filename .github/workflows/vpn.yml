@@ -3,59 +3,66 @@ name: Temporary VPN
 on:
   workflow_dispatch:
 
-env:
-  NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
-
 jobs:
   vpn:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    
-    steps:
-      - name: Install Software
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openvpn easy-rsa curl jq qrencode
-          
-          # Install ngrok
-          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt-get update && sudo apt-get install -y ngrok
 
-      - name: Setup VPN
+    env:
+      NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+      OPENVPN_SERVER_PORT: "1194"
+      CLIENT_NAME: "client1"
+
+    steps:
+      - name: Install software
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            openvpn easy-rsa curl jq qrencode
+
+          curl -fsSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list
+
+          sudo apt-get update
+          sudo apt-get install -y ngrok
+
+      - name: Setup OpenVPN PKI
+        shell: bash
         env:
           EASYRSA_BATCH: "1"
         run: |
-          ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
-          
-          # Create certificates
-          mkdir -p ~/vpn && cd ~/vpn
+          set -euxo pipefail
+
+          ngrok config add-authtoken "$NGROK_TOKEN"
+
+          mkdir -p ~/vpn
+          cd ~/vpn
           cp -r /usr/share/easy-rsa/* .
-          
-          # Initialize PKI
+
           ./easyrsa init-pki
-          
-          # Build CA with explicit CN
+
           EASYRSA_REQ_CN="VPN-CA" ./easyrsa build-ca nopass
-          
-          # Build server cert
           ./easyrsa build-server-full server nopass
-          
-          # Build client cert
-          ./easyrsa build-client-full client1 nopass
-          
-          # Generate DH params
+          ./easyrsa build-client-full "$CLIENT_NAME" nopass
           ./easyrsa gen-dh
-          
-          # Install certs
+
           sudo cp pki/ca.crt pki/issued/server.crt pki/private/server.key pki/dh.pem /etc/openvpn/
           sudo openvpn --genkey --secret /etc/openvpn/ta.key
-          cp pki/ca.crt pki/issued/client1.crt pki/private/client1.key ~/
 
-      - name: Configure and Start
+          cp pki/ca.crt pki/issued/"$CLIENT_NAME".crt pki/private/"$CLIENT_NAME".key ~/
+
+      - name: Configure and start OpenVPN server + ngrok tunnel
+        shell: bash
         run: |
-          # Create server config
-          sudo tee /etc/openvpn/server.conf << EOF
+          set -euxo pipefail
+
+          sudo tee /etc/openvpn/server.conf >/dev/null <<EOF
           port 1194
           proto tcp-server
           dev tun
@@ -77,70 +84,71 @@ jobs:
           status /var/log/openvpn/status.log
           verb 3
           EOF
-          
-          # Enable IP forwarding
-          echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.conf
-          sudo sysctl -p
-          IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-          sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $IFACE -j MASQUERADE
-          
-          # Start OpenVPN
+
+          echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-openvpn.conf >/dev/null
+          sudo sysctl --system >/dev/null
+
+          IFACE=$(ip route | awk '/default/ {print $5; exit}')
+          sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o "$IFACE" -j MASQUERADE
+
           sudo openvpn --config /etc/openvpn/server.conf --daemon
-          sleep 3
-          
-          if ! pgrep -f "openvpn" > /dev/null; then
-            echo "Error: OpenVPN failed to start"
+          sleep 5
+
+          if ! pgrep -x openvpn >/dev/null; then
+            echo "OpenVPN failed to start"
             exit 1
           fi
-          
-          # Start ngrok
-          ngrok tcp 1194 &
-          sleep 10
-          
-          # Get endpoint with retry
-          MAX_RETRIES=10
-          RETRY=0
+
+          ngrok tcp "$OPENVPN_SERVER_PORT" > /tmp/ngrok.log 2>&1 &
+          sleep 8
+
           ENDPOINT=""
-          
-          while [ $RETRY -lt $MAX_RETRIES ]; do
-            sleep 3
-            ENDPOINT=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url' | sed 's/tcp:\/\///')
-            if [ "$ENDPOINT" != "null" ] && [ "$ENDPOINT" != "" ]; then
+          for i in $(seq 1 30); do
+            ENDPOINT=$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null \
+              | jq -r '.tunnels[] | select(.proto == "tcp") | .public_url' 2>/dev/null \
+              | head -n 1 || true)
+
+            if [ -n "$ENDPOINT" ] && [ "$ENDPOINT" != "null" ]; then
               break
             fi
-            RETRY=$((RETRY+1))
-            echo "Waiting for tunnel... attempt $RETRY/$MAX_RETRIES"
+            sleep 2
           done
-          
-          if [ "$ENDPOINT" = "null" ] || [ "$ENDPOINT" = "" ]; then
-            echo "Error: Failed to get ngrok endpoint"
+
+          if [ -z "${ENDPOINT:-}" ] || [ "$ENDPOINT" = "null" ]; then
+            echo "ngrok tunnel did not start or API is not ready"
+            echo "--- ngrok log ---"
+            cat /tmp/ngrok.log || true
             exit 1
           fi
-          
-          HOST=$(echo $ENDPOINT | cut -d':' -f1)
-          PORT=$(echo $ENDPOINT | cut -d':' -f2)
-          
-          echo ""
-          echo "=========================================="
-          echo "VPN IS READY!"
-          echo "Address: $HOST"
-          echo "Port: $PORT"
-          echo "=========================================="
 
-      - name: Generate Client Config
+          PUBLIC_HOST="${ENDPOINT#tcp://}"
+          PUBLIC_HOST="${PUBLIC_HOST%:*}"
+          PUBLIC_PORT="${ENDPOINT##*:}"
+
+          echo "VPN_HOST=${PUBLIC_HOST}" >> "$GITHUB_ENV"
+          echo "VPN_PORT=${PUBLIC_PORT}" >> "$GITHUB_ENV"
+
+          echo "Tunnel ready:"
+          echo "  HOST: $PUBLIC_HOST"
+          echo "  PORT: $PUBLIC_PORT"
+
+      - name: Generate client .ovpn config
+        shell: bash
         run: |
-          HOST=$(grep -oP 'Address: \K[^\s]+' <<< "$(grep -A5 'VPN IS READY' <<< '${{ steps.*.outputs }}')" || echo "UNKNOWN")
-          PORT=$(grep -oP 'Port: \K[^\s]+' <<< "$(grep -A5 'VPN IS READY' <<< '${{ steps.*.outputs }}')" || echo "1194")
-          
-          # Get the actual values from files
+          set -euxo pipefail
+
+          if [ -z "${VPN_HOST:-}" ] || [ -z "${VPN_PORT:-}" ]; then
+            echo "VPN_HOST or VPN_PORT missing"
+            exit 1
+          fi
+
           cd ~/vpn
-          
-          # Create client config
-          cat > ~/client1.ovpn << EOF
+
+          cat > ~/client1.ovpn <<EOF
           client
           dev tun
           proto tcp
-          remote $HOST $PORT
+          remote ${VPN_HOST} ${VPN_PORT}
           resolv-retry infinite
           nobind
           persist-key
@@ -150,54 +158,32 @@ jobs:
           auth SHA256
           verb 3
           key-direction 1
-          
+
           <ca>
           $(cat pki/ca.crt)
           </ca>
-          
+
           <cert>
           $(cat pki/issued/client1.crt)
           </cert>
-          
+
           <key>
           $(cat pki/private/client1.key)
           </key>
-          
+
           <tls-auth>
           $(sudo cat /etc/openvpn/ta.key)
           </tls-auth>
           EOF
-          
+
           echo ""
-          echo "=========================================="
-          echo "CLIENT CONFIGURATION FILE"
-          echo "=========================================="
+          echo "============================================="
+          echo "CLIENT CONFIG READY"
+          echo "============================================="
+          echo "Server target: ${VPN_HOST}:${VPN_PORT}"
+          echo ""
+          echo "Saved to: ~/client1.ovpn"
+          echo "Use this file in OpenVPN Connect on your device"
+          echo "============================================="
           echo ""
           cat ~/client1.ovpn
-          echo ""
-          echo "=========================================="
-          echo "END OF CONFIGURATION"
-          echo "=========================================="
-          echo ""
-          echo "File size: $(wc -c < ~/client1.ovpn) bytes"
-          echo ""
-          echo ">>> INSTRUCTIONS:"
-          echo "1. Copy everything between the 'CLIENT CONFIGURATION' blocks"
-          echo "2. Save as 'client1.ovpn' on your device"
-          echo "3. Import into OpenVPN Connect app"
-          echo ""
-          echo ">>> QR CODE (Endpoint Only):"
-          echo "Server: $HOST:$PORT"
-          echo "$HOST:$PORT" | qrencode -t ANSIUTF8
-          echo ""
-          echo "VPN will remain active for 6 hours"
-          echo "=========================================="
-          
-          # Keep running
-          while true; do 
-            sleep 60
-            # Verify OpenVPN still running
-            if ! pgrep -f "openvpn" > /dev/null; then
-              echo "Warning: OpenVPN stopped at $(date)"
-            fi
-          done
