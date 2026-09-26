@@ -48,7 +48,7 @@ jobs:
           sudo mkdir -p /etc/tinyproxy
           sudo tee /etc/tinyproxy/tinyproxy.conf >/dev/null <<'EOF'
           Port 8888
-          Listen 127.0.0.1
+          Listen 0.0.0.0
           Timeout 600
           DefaultErrorFile "/usr/share/tinyproxy/default.html"
           StatFile "/usr/share/tinyproxy/stats.html"
@@ -92,13 +92,13 @@ jobs:
           fi
 
           ngrok config add-authtoken "$NGROK_TOKEN"
-          ngrok tcp 8888 > /tmp/ngrok.log 2>&1 &
+          ngrok http --scheme=http 8888 > /tmp/ngrok.log 2>&1 &
           sleep 10
 
           ENDPOINT=""
           for i in $(seq 1 30); do
             ENDPOINT=$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null \
-              | jq -r '.tunnels[] | select(.proto == "tcp") | .public_url' 2>/dev/null \
+              | jq -r '.tunnels[] | select(.proto == "http") | .public_url' 2>/dev/null \
               | head -n 1 || true)
 
             if [ -n "$ENDPOINT" ] && [ "$ENDPOINT" != "null" ]; then
@@ -114,17 +114,18 @@ jobs:
             exit 1
           fi
 
-          PUBLIC_URL="${ENDPOINT#tcp://}"
+          PUBLIC_URL="${ENDPOINT#http://}"
+          PUBLIC_URL="${PUBLIC_URL#https://}"
           PUBLIC_HOST="${PUBLIC_URL%:*}"
           PUBLIC_PORT="${PUBLIC_URL##*:}"
 
           if [ "$PUBLIC_PORT" = "$PUBLIC_HOST" ]; then
-            PUBLIC_PORT="8888"
+            PUBLIC_PORT="80"
           fi
 
           echo "PROXY_HOST=${PUBLIC_HOST}" >> "$GITHUB_ENV"
           echo "PROXY_PORT=${PUBLIC_PORT}" >> "$GITHUB_ENV"
-          echo "PROXY_ENDPOINT=${ENDPOINT}" >> "$GITHUB_ENV"
+          echo "PROXY_ENDPOINT=http://${PUBLIC_HOST}:${PUBLIC_PORT}" >> "$GITHUB_ENV"
 
       - name: Display proxy details
         shell: bash
@@ -134,11 +135,18 @@ jobs:
           echo "✓ HTTP PROXY READY"
           echo "=========================================="
           echo ""
-          echo "Proxy: $PROXY_HOST:$PROXY_PORT"
-          echo "URL: $PROXY_ENDPOINT"
+          echo "Proxy Host: $PROXY_HOST"
+          echo "Proxy Port: $PROXY_PORT"
+          echo "Full Endpoint: $PROXY_ENDPOINT"
           echo ""
-          echo "Browser: Set HTTP proxy to $PROXY_HOST port $PROXY_PORT"
-          echo "curl: curl -x http://$PROXY_HOST:$PROXY_PORT https://myip.com"
+          echo "iPhone/iOS: Settings → Wi-Fi → Configure Proxy"
+          echo "  Server: $PROXY_HOST"
+          echo "  Port: $PROXY_PORT"
+          echo ""
+          echo "Windows/Mac: $PROXY_HOST:$PROXY_PORT"
+          echo ""
+          echo "Test command:"
+          echo "  curl -x http://$PROXY_HOST:$PROXY_PORT https://api.ipify.org"
           echo ""
           echo "=========================================="
           echo ""
@@ -170,7 +178,7 @@ jobs:
 
             if ! pgrep -x ngrok >/dev/null; then
               echo "[$(date +'%H:%M:%S')] Restarting ngrok..."
-              ngrok tcp 8888 > /tmp/ngrok.log 2>&1 &
+              ngrok http --scheme=http 8888 > /tmp/ngrok.log 2>&1 &
               sleep 5
             fi
 
@@ -179,7 +187,7 @@ jobs:
             REMAINING_HOURS=$((REMAINING / 3600))
             REMAINING_MINS=$(((REMAINING % 3600) / 60))
 
-            echo "[$(date +'%H:%M:%S')] Proxy online | Host: $PROXY_HOST:$PROXY_PORT | Remaining: ${REMAINING_HOURS}h ${REMAINING_MINS}m"
+            echo "[$(date +'%H:%M:%S')] Proxy online | $PROXY_HOST:$PROXY_PORT | Remaining: ${REMAINING_HOURS}h ${REMAINING_MINS}m"
           done
 
           echo ""
